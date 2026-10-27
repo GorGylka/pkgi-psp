@@ -506,6 +506,10 @@ static void unpack_psp_eboot(const char* path, mbedtls_aes_context* pkg_key, con
 
         uint64_t abs_offset = item_offset + psar_offset + block_offset;
         update_install_progress(NULL, enc_offset + abs_offset);
+        if (pkgi_exit_requested()) {
+            if (cso_block) pkgi_free(cso_block);
+            pkgi_close(outfile); pkgi_rm(path); return;
+        }
         sys_read(pkg, enc_offset + abs_offset, data, block_size);
         aes128_ctr_xor(pkg_key, pkg_iv, abs_offset / 16, data, block_size);
 
@@ -628,6 +632,7 @@ static void unpack_psp_edat(const char* path, mbedtls_aes_context* pkg_key, cons
         if (i % 0x2000 == 0)
             update_install_progress(NULL, enc_offset + item_offset + key_header_offset + block_offset);
 
+        if (pkgi_exit_requested()) { pkgi_close(outfile); pkgi_rm(path); return; }
         sys_read(pkg, enc_offset + item_offset + key_header_offset + block_offset, block, block_size);
         aes128_ctr_xor(pkg_key, pkg_iv, (item_offset + key_header_offset + block_offset)  / 16, block, block_size);
         aes128_psp_decrypt(&psp_key, psp_iv, i * block_size / 16, block, block_size);
@@ -870,6 +875,7 @@ int convert_psp_pkg_iso(const char* pkg_arg, int cso)
                 snprintf(path, sizeof(path), "%s/PSP/THEME/%s", pkgi_get_storage_device(), name);
                 update_install_progress(path + 15, 0);
                 unpack_psp_edat(path, item_key, iv, pkg, enc_offset, data_offset, data_size);
+                if (pkgi_exit_requested()) { pkgi_close(pkg); return 0; }
                 continue;
             }
             else if (type == PKG_TYPE_PSP)
@@ -879,6 +885,7 @@ int convert_psp_pkg_iso(const char* pkg_arg, int cso)
                     snprintf(path, sizeof(path), "%s/ISO/%s [%.9s].%s", pkgi_get_storage_device(), title, id, cso ? "cso" : "iso");
                     update_install_progress(path + 4, 0);
                     unpack_psp_eboot(path, item_key, iv, pkg, enc_offset, data_offset, data_size, cso);
+                    if (pkgi_exit_requested()) { pkgi_close(pkg); return 0; }
                     continue;
                 }
 /*
@@ -911,6 +918,7 @@ int convert_psp_pkg_iso(const char* pkg_arg, int cso)
                 uint8_t GCC_ALIGN(16) buffer[1 << 16];
                 uint32_t size = (uint32_t)min64(data_size, sizeof(buffer));
                 update_install_progress(path + 14, enc_offset + offset);
+                if (pkgi_exit_requested()) { pkgi_close(outfile); pkgi_rm(path); pkgi_close(pkg); return 0; }
 
                 sys_read(pkg, enc_offset + offset, buffer, size);
                 aes128_ctr_xor(item_key, iv, offset / 16, buffer, size);

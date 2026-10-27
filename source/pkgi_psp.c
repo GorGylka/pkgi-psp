@@ -1,4 +1,11 @@
 #include "pkgi.h"
+#include <pspmoduleinfo.h>
+
+// Keep memory outside the C heap for dynamically loaded firmware modules.
+PSP_HEAP_THRESHOLD_SIZE_KB(4096);
+#include "pkgi_native_http.h"
+#include "pkgi_home.h"
+#include <strings.h>
 #include "pkgi_style.h"
 
 #include <sys/stat.h>
@@ -56,6 +63,8 @@ struct pkgi_http
     uint64_t size;
     uint64_t offset;
     CURL *curl;
+    int native;
+    pkgi_native_http native_http;
 };
 
 typedef struct 
@@ -81,6 +90,7 @@ static int g_ok_button;
 static int g_cancel_button;
 static uint32_t g_button_frame_count;
 static uint64_t g_time;
+static int g_home_event;
 
 static int osk_level = 0;
 static uint16_t g_ime_title[SCE_IME_DIALOG_MAX_TITLE_LENGTH];
@@ -542,35 +552,42 @@ int psp_network_up(void)
     return net_up;
 }
 
+static void network_trace(const char* step, int code, const char* mode)
+{
+    FILE* f = fopen("scehttp-debug.txt", mode);
+    if (f)
+    {
+        fprintf(f, "%s: 0x%08X (%d)\n", step, (unsigned int)code, code);
+        fclose(f);
+    }
+}
+
 static int http_init(void)
 {
-	int ret = 0;
-
-	sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
-	sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
-	
-	if ((ret = sceNetInit(128 * 1024, 42, 4 * 1024, 42, 4 * 1024)) < 0) {
-		LOG("sceNetInit() failed: 0x%08x", ret);
-		return -1;
-	}
-
-	if ((ret = sceNetInetInit()) < 0) {
-		LOG("sceNetInetInit() failed: 0x%08x", ret);
-		return -1;
-	}
-
-	if ((ret = sceNetApctlInit(0x8000, 48)) < 0) {
-		LOG("sceNetApctlInit() failed: 0x%08x", ret);
-		return -1;
-	}
-
-	curl_global_init(CURL_GLOBAL_ALL);
-
-	return 0;
+    int ret;
+    network_trace("Network startup memory reserve 4 MiB", 0, "w");
+    ret = sceUtilityLoadNetModule(PSP_NET_MODULE_COMMON);
+    network_trace("Load COMMON", ret, "a");
+    ret = sceUtilityLoadNetModule(PSP_NET_MODULE_INET);
+    network_trace("Load INET", ret, "a");
+    ret = sceNetInit(128 * 1024, 42, 4 * 1024, 42, 4 * 1024);
+    network_trace("sceNetInit", ret, "a");
+    if (ret < 0) return -1;
+    ret = sceNetInetInit();
+    network_trace("sceNetInetInit", ret, "a");
+    if (ret < 0) return -1;
+    ret = sceNetApctlInit(0x8000, 48);
+    network_trace("sceNetApctlInit", ret, "a");
+    if (ret < 0) return -1;
+    if (!pkgi_native_http_init()) return -1;
+    ret = curl_global_init(CURL_GLOBAL_ALL);
+    network_trace("curl_global_init", ret, "a");
+    return ret == CURLE_OK ? 0 : -1;
 }
 
 static void http_end(void)
 {
+    pkgi_native_http_end();
 	curl_global_cleanup();
 
 	sceNetApctlTerm();
@@ -661,6 +678,8 @@ void pkgi_start(void)
 //        return (-1);
     }
 
+    pkgi_home_init();
+
     LOG("initializing Network");
     if (http_init() < 0)
     {
@@ -687,6 +706,13 @@ void pkgi_start(void)
 
 int pkgi_update(pkgi_input* input)
 {
+    SDL_Event event;
+    while (SDL_PollEvent(&event))
+    {
+        // PSP SDL exit callback posts this after HOME -> Yes.
+        // Leave through the normal main-loop cleanup, never from the callback.
+        if (event.type == SDL_QUIT) g_home_event = 1;
+    }
     SceCtrlData padData;
     uint32_t previous = input->down;
 
@@ -704,7 +730,7 @@ int pkgi_update(pkgi_input* input)
         if (padData.Lx > ANALOG_MAX)
             padData.Buttons |= PSP_CTRL_RIGHT;
 
-        input->down = padData.Buttons;
+        input->down = padData.Buttons & ~PSP_CTRL_HOME;
     }
 
     input->pressed = input->down & ~previous;
@@ -731,6 +757,11 @@ int pkgi_update(pkgi_input* input)
     input->delta = time - g_time;
     g_time = time;
 
+    if (pkgi_home_poll() || g_home_event) {
+        input->pressed |= PKGI_BUTTON_HOME;
+        input->active |= PKGI_BUTTON_HOME;
+        g_home_event = 0;
+    }
     return 1;
 }
 
@@ -742,7 +773,7 @@ void pkgi_swap(void)
 
 void pkgi_end(void)
 {
-    curl_global_cleanup();
+    pkgi_home_end();
     pkgi_stop_debug_log();
 
     pkgi_free_texture(tex_buttons.circle);
@@ -872,12 +903,8 @@ const char* pkgi_get_app_folder(void)
 
 int pkgi_is_incomplete(const char* titleid)
 {
-    char path[256];
-    pkgi_snprintf(path, sizeof(path), "%s%s/%s.resume", pkgi_get_storage_device(), pkgi_get_temp_folder(), titleid);
-
-    struct stat st;
-    int res = stat(path, &st);
-    return (res == 0);
+    (void)titleid;
+    return 0; // Downloads always start from zero in this build.
 }
 
 int pkgi_dir_exists(const char* path)
@@ -913,7 +940,7 @@ void pkgi_thread_exit(void)
     sceKernelExitDeleteThread(0);
 }
 
-void pkgi_start_thread(const char* name, pkgi_thread_entry* start)
+int pkgi_start_thread(const char* name, pkgi_thread_entry* start)
 {
     SceUID id;
 
@@ -926,8 +953,11 @@ void pkgi_start_thread(const char* name, pkgi_thread_entry* start)
     }
     else
     {
-        sceKernelStartThread(id, 0, NULL);
+        int rc = sceKernelStartThread(id, 0, NULL);
+        if (rc < 0) { sceKernelDeleteThread(id); return 0; }
+        return 1;
     }
+    return 0;
 }
 
 void pkgi_sleep(uint32_t msec)
@@ -1218,7 +1248,7 @@ pkgi_http* pkgi_http_get(const char* url, const char* content, uint64_t offset)
 {
     LOG("http get");
 
-    if (!pkgi_validate_url(url))
+    if (!url || offset != 0 || (!pkgi_validate_url(url) && strncasecmp(url, "http://", 7) != 0))
     {
         LOG("unsupported URL (%s)", url);
         return NULL;
@@ -1240,6 +1270,15 @@ pkgi_http* pkgi_http_get(const char* url, const char* content, uint64_t offset)
         return NULL;
     }
 
+    memset(http, 0, sizeof(*http));
+    http->native = strncasecmp(url, "http://", 7) == 0;
+    if (http->native)
+    {
+        if (!pkgi_native_http_open(&http->native_http, url)) return NULL;
+        http->used = 1;
+        return http;
+    }
+
     http->curl = curl_easy_init();
     if (!http->curl)
     {
@@ -1252,19 +1291,17 @@ pkgi_http* pkgi_http_get(const char* url, const char* content, uint64_t offset)
 
     LOG("starting http GET request for %s", url);
 
-    if (offset != 0)
-    {
-        LOG("setting http offset %ld", offset);
-        /* resuming upload at this position */
-        curl_easy_setopt(http->curl, CURLOPT_RESUME_FROM_LARGE, (curl_off_t) offset);
-    }
-
     http->used = 1;
     return(http);
 }
 
 int pkgi_http_response_length(pkgi_http* http, int64_t* length)
 {
+    if (http->native)
+    {
+        *length = http->native_http.length;
+        return 1;
+    }
     CURLcode res;
 
     // do the download request without getting the body
@@ -1293,6 +1330,9 @@ int pkgi_http_response_length(pkgi_http* http, int64_t* length)
 
 int pkgi_http_read(pkgi_http* http, void* write_func, void* xferinfo_func)
 {
+    if (http->native)
+        return pkgi_native_http_read(&http->native_http,
+            (pkgi_http_writer)write_func, NULL, (pkgi_http_progress)xferinfo_func);
     CURLcode res;
 
     curl_easy_setopt(http->curl, CURLOPT_NOBODY, 0L);
@@ -1324,7 +1364,8 @@ int pkgi_http_read(pkgi_http* http, void* write_func, void* xferinfo_func)
 void pkgi_http_close(pkgi_http* http)
 {
     LOG("http close");
-    curl_easy_cleanup(http->curl);
+    if (http->native) pkgi_native_http_close(&http->native_http);
+    else curl_easy_cleanup(http->curl);
 
     http->used = 0;
 }
@@ -1477,9 +1518,11 @@ void pkgi_close(void* f)
 
 static size_t curl_write_memory(void *contents, size_t size, size_t nmemb, void *userp)
 {
+    if (size && nmemb > SIZE_MAX / size) return 0;
     size_t realsize = size * nmemb;
     curl_memory_t *mem = (curl_memory_t *)userp;
 
+    if (realsize > SIZE_MAX - mem->size - 1) return 0;
     char *ptr = realloc(mem->memory, mem->size + realsize + 1);
     if(!ptr)
     {
@@ -1498,6 +1541,25 @@ static size_t curl_write_memory(void *contents, size_t size, size_t nmemb, void 
 
 char * pkgi_http_download_buffer(const char* url, uint32_t* buf_size)
 {
+    if (!url || !buf_size) return NULL;
+    *buf_size = 0;
+    if (strncasecmp(url, "http://", 7) == 0)
+    {
+        pkgi_native_http h;
+        curl_memory_t memory = {malloc(1), 0};
+        if (!memory.memory) return NULL;
+        memory.memory[0] = 0;
+        if (!pkgi_native_http_open(&h, url))
+        {
+            free(memory.memory);
+            return NULL;
+        }
+        int ok = pkgi_native_http_read(&h, curl_write_memory, &memory, NULL);
+        pkgi_native_http_close(&h);
+        if (!ok) { free(memory.memory); return NULL; }
+        *buf_size = memory.size;
+        return memory.memory;
+    }
     CURL *curl;
     CURLcode res;
     curl_memory_t chunk;
@@ -1510,6 +1572,8 @@ char * pkgi_http_download_buffer(const char* url, uint32_t* buf_size)
     }
     
     chunk.memory = malloc(1);   /* will be grown as needed by the realloc above */
+    if (!chunk.memory) { curl_easy_cleanup(curl); return NULL; }
+    chunk.memory[0] = 0;
     chunk.size = 0;             /* no data at this point */
 
     pkgi_curl_init(curl);

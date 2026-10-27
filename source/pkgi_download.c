@@ -2,12 +2,12 @@
 #include "pkgi_dialog.h"
 #include "pkgi.h"
 #include "pkgi_utils.h"
-#include "pkgi_sha256.h"
 
 #include <sys/stat.h>
 #include <sys/file.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <dirent.h>
 #include <mini18n.h>
 
@@ -17,17 +17,27 @@ static char resume_file[256];
 
 static pkgi_http* http;
 static const DbItem* db_item;
-static int download_resume;
 
-static uint64_t initial_offset;  // where http download resumes
+static uint64_t initial_offset;  // zero for fresh downloads
 static uint64_t download_offset; // pkg absolute offset
 static uint64_t download_size;   // pkg total size (from http request)
-
-static mbedtls_sha256_context sha;
 
 static void* item_file;     // current file handle
 static char item_name[256]; // current file name
 static char item_path[256]; // current file path
+
+#define DOWNLOAD_CACHE_SIZE (8u * 1024u * 1024u)
+static unsigned char* download_cache;
+static size_t cache_used;
+
+static int flush_download_cache(void)
+{
+    if (cache_used && !pkgi_write(item_file, download_cache, cache_used))
+        return 0;
+    cache_used = 0;
+    return 1;
+}
+
 
 // pkg header
 static uint64_t total_size;
@@ -68,15 +78,9 @@ static int update_progress(void *p, int64_t dltotal, int64_t dlnow, int64_t ulto
         char text[256];
         pkgi_snprintf(text, sizeof(text), "%s", item_name);
 
-        if (download_resume)
-        {
-            // if resuming download, then there is no "download speed"
-            dialog_extra[0] = 0;
-        }
-        else
         {
             // report download speed
-            uint32_t speed = (uint32_t)(((download_offset - initial_offset) * 1000) / (info_now - info_start));
+            uint32_t speed = (uint32_t)(((download_offset - initial_offset) * 1000) / ((info_now - info_start) ? (info_now - info_start) : 1));
             if (speed > 10 * 1000 * 1024)
             {
                 pkgi_snprintf(dialog_extra, sizeof(dialog_extra), "%u %s/s", speed / 1024 / 1024, _("MB"));
@@ -100,30 +104,28 @@ static int update_progress(void *p, int64_t dltotal, int64_t dlnow, int64_t ulto
         progress_screen_refresh();
     }
 
-    return (pkgi_dialog_is_cancelled());
+    return (pkgi_dialog_is_cancelled() || pkgi_exit_requested());
 }
 
-static size_t write_verify_data(void *buffer, size_t size, size_t nmemb, void *stream)
+static size_t write_download_data(void *buffer, size_t size, size_t nmemb, void *stream)
 {
-    size_t realsize = size * nmemb;
-
-    if (pkgi_write(item_file, buffer, realsize))
+    if (size && nmemb > SIZE_MAX / size) return 0;
+    size_t length = size * nmemb;
+    size_t remaining = length;
+    const unsigned char* data = buffer;
+    while (remaining)
     {
-        download_offset += realsize;
-        mbedtls_sha256_update(&sha, buffer, realsize);
-        return (realsize);
+        size_t count = DOWNLOAD_CACHE_SIZE - cache_used;
+        if (count > remaining) count = remaining;
+        memcpy(download_cache + cache_used, data, count);
+        cache_used += count;
+        data += count;
+        remaining -= count;
+        if (cache_used == DOWNLOAD_CACHE_SIZE && !flush_download_cache())
+            return 0;
     }
-
-    return 0;
-}
-
-static void download_start(void)
-{
-    LOG("resuming pkg download from %llu offset", initial_offset);
-    download_offset = initial_offset;
-    download_resume = 0;
-    info_update = pkgi_time_msec() + 1000;
-    pkgi_dialog_set_progress_title(_("Downloading..."));
+    download_offset += length;
+    return length;
 }
 
 static int download_data(void)
@@ -164,9 +166,8 @@ static int download_data(void)
         info_update = pkgi_time_msec() + 500;
     }
 
-    if (!pkgi_http_read(http, &write_verify_data, &update_progress))
+    if (!pkgi_http_read(http, &write_download_data, &update_progress))
     {
-        pkgi_save(resume_file, &sha, sizeof(sha));
 
         if (!pkgi_dialog_is_cancelled())
         {
@@ -207,21 +208,6 @@ static int create_file(void)
     return 1;
 }
 
-static int resume_partial_file(void)
-{
-    LOG("resuming %s file", item_name);
-    item_file = pkgi_append(item_path);
-    if (!item_file)
-    {
-        char error[256];
-        pkgi_snprintf(error, sizeof(error), "%s %s", _("cannot resume file"), item_name);
-        pkgi_dialog_error(error);
-        return 0;
-    }
-
-    return 1;
-}
-
 static int download_pkg_file(void)
 {
     int result = 0;
@@ -230,18 +216,25 @@ static int download_pkg_file(void)
     pkgi_snprintf(item_path, sizeof(item_path), "%s%s/%s", pkgi_get_storage_device(), pkgi_get_temp_folder(), root);
     LOG("downloading %s", item_name);
 
-    if (download_resume)
+    download_cache = malloc(DOWNLOAD_CACHE_SIZE);
+    cache_used = 0;
+    if (!download_cache)
     {
-        initial_offset = pkgi_get_size(item_path);
-        if (!resume_partial_file()) goto bail;
-        download_start();
+        pkgi_dialog_error("Cannot allocate 8 MiB download cache");
+        return 0;
     }
-    else
-    {
-        if (!create_file()) goto bail;
-    }
-
+    if (!create_file()) goto bail;
     if (!download_data()) goto bail;
+    if (download_offset != total_size)
+    {
+        pkgi_dialog_error("Incomplete download");
+        goto bail;
+    }
+    if (!flush_download_cache())
+    {
+        pkgi_dialog_error("Memory Stick write error");
+        goto bail;
+    }
 
     LOG("%s downloaded", item_path);
     result = 1;
@@ -249,37 +242,19 @@ static int download_pkg_file(void)
 bail:
     if (item_file != NULL)
     {
-        pkgi_close(item_file);
+        // Include the final stdio flush in success/failure handling.
+        if (fclose((FILE*)item_file) != 0)
+        {
+            pkgi_dialog_error("Memory Stick write error");
+            result = 0;
+        }
         item_file = NULL;
     }
+    free(download_cache);
+    download_cache = NULL;
+    cache_used = 0;
+    if (!result) pkgi_rm(item_path);
     return result;
-}
-
-static int check_integrity(const uint8_t* digest)
-{
-    if (!digest)
-    {
-        LOG("no integrity provided, skipping check");
-        return 1;
-    }
-
-    uint8_t check[SHA256_DIGEST_SIZE];
-    mbedtls_sha256_finish(&sha, check);
-
-    LOG("checking integrity of pkg");
-    if (!pkgi_memequ(digest, check, SHA256_DIGEST_SIZE))
-    {
-        LOG("pkg integrity is wrong, removing %s & resume data", item_path);
-
-        pkgi_rm(item_path);
-        pkgi_rm(resume_file);
-
-        pkgi_dialog_error(_("pkg integrity failed, try downloading again"));
-        return 0;
-    }
-
-    LOG("pkg integrity check succeeded");
-    return 1;
 }
 
 static int create_rap(const char* contentid, const uint8_t* rap)
@@ -316,27 +291,15 @@ int pkgi_download(const DbItem* item)
     LOG("package installation file: %s", root);
 
     pkgi_snprintf(resume_file, sizeof(resume_file), "%s%s/%s.resume", pkgi_get_storage_device(), pkgi_get_temp_folder(), item->content);
-    if (pkgi_load(resume_file, &sha, sizeof(sha)) == sizeof(sha))
+    if (item->type == ContentLocal)
     {
-        LOG("resume file exists, trying to resume");
-        pkgi_dialog_set_progress_title(_("Resuming..."));
-        download_resume = 1;
+        pkgi_strncpy(root, sizeof(root), item->url);
+        pkgi_snprintf(item_path, sizeof(item_path), "%s%s/%s", pkgi_get_storage_device(), pkgi_get_temp_folder(), root);
+        return 1;
     }
-    else
-    {
-        if (item->type == ContentLocal)
-        {
-            pkgi_strncpy(root, sizeof(root), item->url);
-            pkgi_snprintf(item_path, sizeof(item_path), "%s%s/%s", pkgi_get_storage_device(), pkgi_get_temp_folder(), root);
-            return 1;
-        }
-
-        LOG("cannot load resume file, starting download from scratch");
-        pkgi_dialog_set_progress_title(_("Downloading..."));
-        download_resume = 0;
-        mbedtls_sha256_init(&sha);
-        mbedtls_sha256_starts(&sha, 0);
-    }
+    // Old builds may have left resume metadata; this build always starts at zero.
+    pkgi_rm(resume_file);
+    pkgi_dialog_set_progress_title(_("Downloading..."));
 
     http = NULL;
     item_file = NULL;
@@ -357,7 +320,6 @@ int pkgi_download(const DbItem* item)
     }
 
     if (!download_pkg_file()) goto finish;
-    if (!check_integrity(item->digest)) goto finish;
 
     pkgi_rm(resume_file);
     result = 1;

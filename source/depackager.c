@@ -10,6 +10,8 @@
 
 #include "pkgi.h"
 #include "pkgi_download.h"
+#include "pkgi_pair_crypto.h"
+#include "pkgi_install_profile.h"
 
 #define DEPACKAGER_VER 3
 
@@ -54,22 +56,10 @@ static const u8 PSPAESKey[16] __attribute__((aligned(16))) = {
 };
 
 
-static void AES128_ECB_encrypt(uint8_t* input, const uint8_t* key, uint8_t *output)
+// The key schedule is prepared once per installation, not once per block.
+static void AES128_ECB_encrypt(mbedtls_aes_context* ctx, const uint8_t* input, uint8_t* output)
 {
-	mbedtls_aes_context ctx;
-
-	mbedtls_aes_init(&ctx);
-	mbedtls_aes_setkey_enc(&ctx, key, 128);
-	mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, input, output);
-}
-
-static void AES128_ECB_decrypt(uint8_t* input, const uint8_t* key, uint8_t *output)
-{
-	mbedtls_aes_context ctx;
-
-	mbedtls_aes_init(&ctx);
-	mbedtls_aes_setkey_dec(&ctx, key, 128);
-	mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_DECRYPT, input, output);
+    mbedtls_aes_crypt_ecb(ctx, MBEDTLS_AES_ENCRYPT, input, output);
 }
 
 static u32 toU32(char *_buf)
@@ -151,14 +141,38 @@ static void iter128(u8 *buf)
 	}
 }
 
-static void setiter128(u8 *dst, int size)
+static void setiter128(u8 *dst, u32 blocks)
 {
-	memcpy(dst, static_public_key, 16);
+    memcpy(dst, static_public_key, 16);
+    // Add the block offset to the big-endian 128-bit counter, modulo 2^128.
+    // Include carry propagation through all 16 bytes.
+    for (int i = 15; i >= 0 && blocks; --i) {
+        u32 sum = (u32)dst[i] + (blocks & 0xffu);
+        dst[i] = (u8)sum;
+        blocks = (blocks >> 8) + (sum >> 8);
+    }
+}
 
-	int i;
+static int read_exact(SceUID fd, void* buffer, unsigned size)
+{
+    unsigned done = 0;
+    while (done < size) {
+        int n = sceIoRead(fd, (char*)buffer + done, size - done);
+        if (n <= 0 || (unsigned)n > size - done) return 0;
+        done += n;
+    }
+    return 1;
+}
 
-	for (i = 0; i < size; i++)
-		iter128(dst);
+static int write_exact(SceUID fd, const void* buffer, unsigned size)
+{
+    unsigned done = 0;
+    while (done < size) {
+        int n = sceIoWrite(fd, (const char*)buffer + done, size - done);
+        if (n <= 0 || (unsigned)n > size - done) return 0;
+        done += n;
+    }
+    return 1;
 }
 
 int install_psp_pkg(const char *file)
@@ -206,8 +220,18 @@ int install_psp_pkg(const char *file)
 	tmpBuf = (char *)malloc(1024 * 1024);
 	if (!tmpBuf) {
 		LOG("Error allocating memory: 0x%08X", 1024 * 1024);
+        sceIoClose(fd);
 		return 0;
 	}
+
+    mbedtls_aes_context aes_ctx;
+    mbedtls_aes_init(&aes_ctx);
+    if (mbedtls_aes_setkey_enc(&aes_ctx, PSPAESKey, 128) != 0) {
+        mbedtls_aes_free(&aes_ctx);
+        free(tmpBuf);
+        sceIoClose(fd);
+        return 0;
+    }
 
 	sceIoLseek(fd, toU32(pkgBuf + 8) + 0x48, PSP_SEEK_SET);
 	sceIoRead(fd, gameid, 9);
@@ -226,7 +250,7 @@ int install_psp_pkg(const char *file)
 	u32 file_name[files], file_name_len[files], file_offset[files], file_size[files], is_file[files];
 
 	for (i = 0; i < (int)(files * 2); i++) {
-		AES128_ECB_encrypt(public_key, PSPAESKey, xor_key);
+		AES128_ECB_encrypt(&aes_ctx, public_key, xor_key);
 		xor128((u8 *)(tmpBuf + (i * 16)), (u8 *)(tmpBuf + (i * 16)), xor_key);
 		iter128(public_key);
 	}
@@ -243,8 +267,14 @@ int install_psp_pkg(const char *file)
 	}
 
 	int files_extracted = 0;
+    int install_ok = 1;
+    pkgi_profile_begin();
+    uint64_t tick = pkgi_profile_now();
+    int use_me = pkgi_me_begin(PSPAESKey);
+    pkgi_profile_add(PROF_START, tick);
 
 	for (i = 0; i < pspcount; i++) {
+        if (pkgi_exit_requested()) { install_ok = 0; goto install_cleanup; }
 		sceIoLseek(fd, enc_start + file_name[i], PSP_SEEK_SET);
 		int namesize = (file_name_len[i] + 15) & -16;
 		sceIoRead(fd, tmpBuf, namesize);
@@ -253,7 +283,7 @@ int install_psp_pkg(const char *file)
 		setiter128(public_key, file_name[i] >> 4);
 
 		for (j = 0; j < (namesize >> 4); j++) {
-			AES128_ECB_encrypt(public_key, PSPAESKey, xor_key);
+			AES128_ECB_encrypt(&aes_ctx, public_key, xor_key);
 			xor128((u8 *)(tmpBuf + (j * 16)), (u8 *)(tmpBuf + (j * 16)), xor_key);
 			iter128(public_key);
 		}
@@ -269,53 +299,60 @@ int install_psp_pkg(const char *file)
 			LOG("Currently extracting: %s", path);
 			files_extracted++;
 
-			progress = sceIoLseek(fd, enc_start + file_offset[i], PSP_SEEK_SET);
-			sceIoRead(fd, tmpBuf, 1024 * 1024);
-			update_install_progress(path + 14, progress);
-
-			setiter128(public_key, file_offset[i] >> 4);
-
-			SceUID dstfd = sceIoOpen(path, 0x602, 0777);
-
-			u32 szcheck = 0, mincheck = 0;
-
-			LOG("%d/%d bytes", mincheck, file_size[i]);
-
-			for (j = 0; j < (int)(file_size[i] >> 4); j++) {
-				if (szcheck == 1024 * 1024) {
-					szcheck = 0;
-					mincheck += 1024 * 1024;
-
-					sceIoWrite(dstfd, tmpBuf, 1024 * 1024);
-					sceIoRead(fd, tmpBuf, 1024 * 1024);
-					update_install_progress(NULL, progress + mincheck);
-
-					LOG("%d/%d bytes", mincheck, file_size[i]);
-				}
-
-				AES128_ECB_encrypt(public_key, PSPAESKey, xor_key);
-				xor128((u8 *)((tmpBuf + (j * 16)) - mincheck), (u8 *)((tmpBuf + (j * 16)) - mincheck), xor_key);
-				iter128(public_key);
-
-				szcheck += 16;
-			}
-
-			if (mincheck < file_size[i])
-			{
-				sceIoWrite(dstfd, tmpBuf, file_size[i] - mincheck);
-				update_install_progress(NULL, progress + file_size[i]);
-			}
-
-			sceIoClose(dstfd);
+            uint64_t source_offset = (uint64_t)enc_start + file_offset[i];
+            progress = sceIoLseek(fd, source_offset, PSP_SEEK_SET);
+            if (progress != (SceOff)source_offset) { install_ok = 0; goto install_cleanup; }
+            update_install_progress(path + 14, progress);
+            SceUID dstfd = sceIoOpen(path, PSP_O_WRONLY | PSP_O_CREAT | PSP_O_TRUNC, 0777);
+            if (dstfd < 0) { install_ok = 0; goto install_cleanup; }
+            uint32_t done = 0;
+            while (done < file_size[i]) {
+                if (pkgi_exit_requested()) { install_ok = 0; break; }
+                uint32_t size = file_size[i] - done;
+                if (size > 2u * PKGI_ME_BLOCK_SIZE) size = 2u * PKGI_ME_BLOCK_SIZE;
+                tick = pkgi_profile_now();
+                int stage_ok = read_exact(fd, tmpBuf, size);
+                pkgi_profile_add(PROF_READ, tick);
+                if (stage_ok) {
+                    tick = pkgi_profile_now();
+                    stage_ok = pkgi_decrypt_pair(&aes_ctx, static_public_key,
+                        ((uint64_t)file_offset[i] + done) / 16,
+                        (uint8_t*)tmpBuf, size, use_me);
+                    pkgi_profile_add(PROF_DECRYPT, tick);
+                }
+                if (stage_ok) {
+                    tick = pkgi_profile_now();
+                    stage_ok = write_exact(dstfd, tmpBuf, size);
+                    pkgi_profile_add(PROF_WRITE, tick);
+                }
+                if (!stage_ok) { install_ok = 0; break; }
+                pkgi_profile_bytes(size);
+                done += size;
+                tick = pkgi_profile_now();
+                update_install_progress(NULL, progress + done);
+                pkgi_profile_add(PROF_UI, tick);
+            }
+            if (pkgi_exit_requested()) install_ok = 0;
+            if (sceIoClose(dstfd) < 0) install_ok = 0;
+            if (!install_ok) {
+                sceIoRemove(path);
+                goto install_cleanup;
+            }
 		}
 	}
 
-	update_install_progress(file + 9, fdsize);
+install_cleanup:
+    tick = pkgi_profile_now();
+    pkgi_me_end();
+    pkgi_profile_add(PROF_STOP, tick);
+    if (install_ok) update_install_progress(file + 9, fdsize);
 	sceIoClose(fd);
 	free(tmpBuf);
+    mbedtls_aes_free(&aes_ctx);
 
 	LOG("files extracted: %d", files_extracted);
 	LOG("Installation complete");
 
-	return 1;
+    pkgi_profile_finish(install_ok, use_me);
+	return install_ok;
 }

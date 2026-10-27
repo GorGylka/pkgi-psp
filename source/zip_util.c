@@ -39,6 +39,7 @@ int extract_zip(const char* zip_file)
 		const char* filename = zip_get_name(archive, i, 0);
 
 		update_install_progress(filename, (zsize * i)/files);
+        if (pkgi_exit_requested()) { free(buffer); zip_close(archive); return 0; }
 		LOG("Unzip [%d/%d] '%s'...", i+1, files, filename);
 
 		if (!filename)
@@ -81,6 +82,11 @@ int extract_zip(const char* zip_file)
 
 		uint64_t pos = 0, count;
 		while (pos < st.size) {
+            update_install_progress(NULL, (zsize * i)/files);
+            if (pkgi_exit_requested()) {
+                fclose(tfd); zip_fclose(zfd); zip_close(archive);
+                free(buffer); pkgi_rm(path); return 0;
+            }
 			count = min64(UNZIP_BUF_SIZE, st.size - pos);
 			if (zip_fread(zfd, buffer, count) != count) {
 				free(buffer);

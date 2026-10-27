@@ -144,11 +144,11 @@ void pkgi_dialog_close(void)
     dialog_delta = -1;
 }
 
-void pkgi_do_dialog(pkgi_input* input)
+static void draw_dialog(pkgi_input* input, int exit_prompt)
 {
     pkgi_dialog_lock();
 
-    if (dialog_allow_close)
+    if (!exit_prompt && dialog_allow_close)
     {
         if ((dialog_type == DialogMessage || dialog_type == DialogError || dialog_type == DialogDetails) && (input->pressed & pkgi_ok_button()))
         {
@@ -185,7 +185,7 @@ void pkgi_do_dialog(pkgi_input* input)
 */
     }
 
-    if (dialog_delta != 0)
+    if (!exit_prompt && dialog_delta != 0)
     {
         dialog_width += dialog_delta * (int32_t)(input->delta * PKGI_ANIMATION_SPEED / 1000);
         dialog_height += dialog_delta * (int32_t)(input->delta * PKGI_ANIMATION_SPEED / 500);
@@ -235,6 +235,16 @@ void pkgi_do_dialog(pkgi_input* input)
     pkgi_strncpy(local_text, sizeof(local_text), dialog_text);
     pkgi_strncpy(local_extra, sizeof(local_extra), dialog_extra);
     pkgi_strncpy(local_eta, sizeof(local_eta), dialog_eta);
+    if (exit_prompt) {
+        local_type = DialogOkCancel;
+        local_allow_close = 1;
+        local_width = PKGI_DIALOG_WIDTH;
+        local_height = PKGI_DIALOG_HEIGHT;
+        pkgi_snprintf(local_title, sizeof(local_title), "\xE2\x98\x85  PKGi PSP v%s  \xE2\x98\x85", PKGI_VERSION);
+        pkgi_strncpy(local_text, sizeof(local_text), _("Exit to XMB?"));
+        local_extra[0] = local_eta[0] = 0;
+    }
+
 
     pkgi_dialog_unlock();
 
@@ -416,3 +426,5 @@ int pkgi_msg_dialog(int tdialog, const char * str)
     return (msg_dialog_action == 1);
 }
 */
+void pkgi_do_dialog(pkgi_input* input) { draw_dialog(input, 0); }
+void pkgi_draw_exit_dialog(pkgi_input* input) { draw_dialog(input, 1); }

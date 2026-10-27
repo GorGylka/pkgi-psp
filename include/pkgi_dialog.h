@@ -34,3 +34,5 @@ void pkgi_dialog_close(void);
 void pkgi_do_dialog(pkgi_input* input);
 
 int pkgi_msg_dialog(int tdialog, const char * str);
+
+void pkgi_draw_exit_dialog(pkgi_input* input);

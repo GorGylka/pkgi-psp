@@ -6,6 +6,7 @@
 #include "pkgi_download.h"
 #include "pkgi_utils.h"
 #include "pkgi_style.h"
+#include "pkgi_stream.h"
 
 #include <stddef.h>
 #include <mini18n.h>
@@ -23,6 +24,10 @@ typedef enum  {
 } State;
 
 static State state;
+static volatile int exit_requested;
+static volatile int refreshing;
+int pkgi_exit_requested(void) { return exit_requested; }
+static void handle_home(void);
 
 static uint32_t first_item;
 static uint32_t selected_item;
@@ -78,6 +83,7 @@ static void pkgi_refresh_thread(void)
         state = StateError;
     }
     
+    refreshing = 0;
     pkgi_thread_exit();
 }
 
@@ -100,9 +106,22 @@ static void pkgi_do_download(void)
     LOG("download thread start");
 
     pkgi_lock_process();
-    if (pkgi_download(item))
+    const char* ext = pkgi_strrchr(item->url, '.');
+    if (!config.install_mode_iso && !item->rap &&
+        (item->type == ContentGame || item->type == ContentDemo) &&
+        !(ext && pkgi_stricmp(ext, ".zip") == 0)) {
+        int ok = pkgi_stream_download(item);
+        if (ok && !exit_requested) pkgi_dialog_message(item->name, _("Successfully installed"));
+        pkgi_unlock_process();
+        item->presence = PresenceUnknown;
+        state = exit_requested ? StateTerminate : StateMain;
+        return;
+    }
+    if (pkgi_download(item) && !exit_requested)
     {
-        if (install())
+        int installed = install();
+        if (exit_requested) { pkgi_unlock_process(); return; }
+        if (installed)
         {
             pkgi_dialog_message(item->name, _("Successfully installed"));
             LOG("install succeeded");
@@ -121,7 +140,7 @@ static void pkgi_do_download(void)
     }
 
     item->presence = PresenceUnknown;
-    state = StateMain;
+    state = exit_requested ? StateTerminate : StateMain;
 }
 
 static uint32_t friendly_size(uint64_t size)
@@ -229,6 +248,7 @@ static const char* content_type_str(ContentType content)
 
 static void cb_dialog_exit(int res)
 {
+    exit_requested = 1;
     state = StateTerminate;
 }
 
@@ -688,9 +708,31 @@ static void pkgi_load_language(const char* lang)
     mini18n_set_locale(path);
 }
 
+static void handle_home(void)
+{
+    if (!(input.pressed & PKGI_BUTTON_HOME) || exit_requested) return;
+    // Entering edge only opens the prompt; a held button never confirms it.
+    input.pressed = input.active = 0;
+    for (;;) {
+        pkgi_draw_background(background);
+        pkgi_do_head();
+        pkgi_draw_exit_dialog(&input);
+        pkgi_do_tail();
+        pkgi_swap();
+        pkgi_update(&input);
+        if (input.pressed & (PKGI_BUTTON_HOME | pkgi_ok_button())) {
+            cb_dialog_exit(MDIALOG_OK);
+            break;
+        }
+        if (input.pressed & pkgi_cancel_button()) break;
+    }
+    input.pressed = input.active = 0;
+}
+
 void progress_screen_refresh(void)
 {
     pkgi_update(&input);
+    handle_home();
 
     pkgi_draw_background(background);
     pkgi_do_head();
@@ -716,13 +758,16 @@ int main(int argc, char* argv[])
     bottom_y = PKGI_SCREEN_HEIGHT - (PKGI_MAIN_VMARGIN + font_height);
 
     state = StateRefreshing;
-    pkgi_start_thread("refresh_thread", &pkgi_refresh_thread);
+    refreshing = 1;
+    if (!pkgi_start_thread("refresh_thread", &pkgi_refresh_thread)) { refreshing = 0; state = StateError; }
 
     background = pkgi_load_image_buffer(background, png);
 
     memset(&input, 0, sizeof(pkgi_input));
-    while (pkgi_update(&input) && (state != StateTerminate))
+    while (pkgi_update(&input) && !exit_requested && (state != StateTerminate))
     {
+        handle_home();
+        if (exit_requested) break;
         pkgi_draw_background(background);
 
         if (state == StateUpdateDone)
@@ -830,7 +875,8 @@ int main(int argc, char* argv[])
                 else if (mres == MenuResultRefresh)
                 {
                     state = StateRefreshing;
-                    pkgi_start_thread("refresh_thread", &pkgi_refresh_thread);
+                    refreshing = 1;
+                    if (!pkgi_start_thread("refresh_thread", &pkgi_refresh_thread)) { refreshing = 0; state = StateError; }
                 }
             }
         }
@@ -838,6 +884,7 @@ int main(int argc, char* argv[])
         pkgi_swap();
     }
 
+    while (refreshing) pkgi_sleep(10);
     LOG("finished");
     mini18n_close();
     pkgi_free_texture(background);
