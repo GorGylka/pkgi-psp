@@ -1,4 +1,4 @@
-Faster Version of ```PKGi```
+Faster Version of ```PKGi``` , made with ai
 
 # Improvements:  
 - ```libcurl``` has been replaced with ```sceHTTP``` to increase download speeds
