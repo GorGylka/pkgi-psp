@@ -1,8 +1,11 @@
-> **CPU + ME pair prototype v1:** read `ME_PAIR_README_RU.md` and `ME_PAIR_VALIDATION.md` for current build and test status.
+Faster Version of ```PKGi```
 
-> **Experimental sceHttp / 8 MiB variant:** see [SCEHTTP_BUILD.md](SCEHTTP_BUILD.md).
-> This variant disables SHA-256 download verification and resume, overriding the upstream descriptions below.
+# Improvements:  
+- ```libcurl``` has been replaced with ```sceHTTP``` to increase download speeds
+- Installation occurs simultaneously with the download to increase overall download speed
+- Decryption is handled by the ```ME``` co-processor so as not to burden ```CPU``` during download to increasing boot speed. [taken from here:](https://github.com/mcidclan/psp-media-engine-reload)  
 
+Below original README
 # PKGi PSP
 
 [![Downloads][img_downloads]][pkgi_downloads] [![Release][img_latest]][pkgi_latest] [![License][img_license]][pkgi_license]
