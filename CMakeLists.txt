@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.2)
+cmake_minimum_required(VERSION 3.10)
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   if(NOT DEFINED ENV{PSPDEV})
@@ -6,7 +6,7 @@ if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
   endif()
 endif()
 
-project(pkgi-psp)
+project(pkgi-psp C CXX ASM)
 
 find_package(SDL2 REQUIRED)
 find_package(CURL REQUIRED)
@@ -59,6 +59,11 @@ add_executable(${PROJECT_NAME}
   ${apollo_res}
   source/pkg2iso.c
   source/depackager.c
+  source/pkgi_stream_unpack.c
+  source/pkgi_stream_download.c
+  source/pkgi_pair_crypto.c
+  source/pkgi_home.c
+  source/pkgi_install_profile.c
   source/loadpng.c
   source/libfont.c
   source/ttf_fonts.c
@@ -67,18 +72,41 @@ add_executable(${PROJECT_NAME}
   source/pkgi_aes.c
   source/pkgi_db.c
   source/pkgi_download.c
+  source/pkgi_native_http.c
   source/pkgi_psp.c
   source/pkgi_config.c
   source/pkgi_dialog.c
   source/pkgi_menu.c
 )
 
+option(PKGI_ENABLE_ME "Experimental CPU + Media Engine package installer" ON)
+if(PKGI_ENABLE_ME)
+  target_compile_definitions(${PROJECT_NAME} PRIVATE PKGI_ME_PAIR_PROTOTYPE=1)
+  find_path(PKGI_ME_INCLUDE me-core-mapper/me-core.h REQUIRED)
+  find_library(PKGI_ME_CORE me-core REQUIRED)
+  find_library(PKGI_ME_LIB me-core-lib REQUIRED)
+  find_library(PKGI_VME_LIB vme-lib REQUIRED)
+  target_sources(${PROJECT_NAME} PRIVATE source/pkgi_me_worker.cpp)
+  target_include_directories(${PROJECT_NAME} PRIVATE ${PKGI_ME_INCLUDE})
+  set_source_files_properties(source/pkgi_me_worker.cpp PROPERTIES
+    COMPILE_OPTIONS "-G0;-fno-pic;-fno-exceptions;-fno-rtti")
+  target_link_libraries(${PROJECT_NAME}
+    ${PKGI_ME_CORE} ${PKGI_ME_LIB} ${PKGI_VME_LIB} pspsdk psppower)
+else()
+  target_sources(${PROJECT_NAME} PRIVATE source/pkgi_me_stub.c)
+endif()
+
+add_subdirectory(home)
+
 target_link_libraries(${PROJECT_NAME}
+  pkgi_home_bridge
+  pspsdk
   ${SDL2_LIBRARIES}
   CURL::libcurl
   dbglogger
   freetype
   png
+  psphttp
   pspnet
   pspnet_apctl
   mini18n
@@ -94,7 +122,7 @@ create_pbp_file(
   BACKGROUND_PATH NULL
   PREVIEW_PATH NULL
   TITLE "PKGi PSP"
-  VERSION 01.10
+  VERSION 01.16
 )
 
 add_custom_target(createzip

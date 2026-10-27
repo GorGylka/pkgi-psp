@@ -1,3 +1,8 @@
+> **CPU + ME pair prototype v1:** read `ME_PAIR_README_RU.md` and `ME_PAIR_VALIDATION.md` for current build and test status.
+
+> **Experimental sceHttp / 8 MiB variant:** see [SCEHTTP_BUILD.md](SCEHTTP_BUILD.md).
+> This variant disables SHA-256 download verification and resume, overriding the upstream descriptions below.
+
 # PKGi PSP
 
 [![Downloads][img_downloads]][pkgi_downloads] [![Release][img_latest]][pkgi_latest] [![License][img_license]][pkgi_license]
